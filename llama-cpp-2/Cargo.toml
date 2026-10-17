@@ -29,6 +29,9 @@ default = ["openmp", "android-shared-stdcxx", "common"]
 # `wrapper_common.cpp` bindings from the link line. Enabled by default for
 # backwards compatibility.
 common = ["llama-cpp-sys-2/common"]
+# zvec-ai: forward to the sys crate's prebuilt linking path (see
+# llama-cpp-sys-2/build.rs). Does not change any Rust source in this crate.
+prebuilt = ["llama-cpp-sys-2/prebuilt"]
 cuda = ["llama-cpp-sys-2/cuda"]
 cuda-no-vmm = ["cuda", "llama-cpp-sys-2/cuda-no-vmm"]
 metal = ["llama-cpp-sys-2/metal"]

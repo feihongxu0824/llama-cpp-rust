@@ -8,3 +8,6 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# zvec-ai: prebuilt bundle staging output (see .github/workflows/build-prebuilt.yml)
+dist/

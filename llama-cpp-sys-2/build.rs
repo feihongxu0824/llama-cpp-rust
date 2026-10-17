@@ -388,6 +388,193 @@ fn is_hidden(e: &DirEntry) -> bool {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// zvec-ai prebuilt support
+//
+// When the `prebuilt` feature is enabled (or `ZVEC_LLAMA_PREBUILT_DIR` is set),
+// the build script skips bindgen, the `cc` wrapper compile and the CMake build
+// of llama.cpp entirely, and instead links against a per-platform bundle
+// produced by this fork's release CI:
+//
+//   $ZVEC_LLAMA_PREBUILT_DIR/
+//     bindings.rs   platform-specific bindgen output (matches the archives)
+//     lib/          static archives (libllama.a, libggml*.a, the wrapper, ...)
+//
+// The upstream from-source path further down in `main` is left untouched so it
+// remains a working fallback and stays merge-friendly with upstream.
+// ---------------------------------------------------------------------------
+
+/// Map an archive file name to the `-l static=` library name.
+fn prebuilt_archive_lib_name(file_name: &str) -> Option<String> {
+    let stem = if let Some(stem) = file_name.strip_suffix(".a") {
+        stem
+    } else if let Some(stem) = file_name.strip_suffix(".lib") {
+        stem
+    } else {
+        return None;
+    };
+    Some(stem.strip_prefix("lib").unwrap_or(stem).to_string())
+}
+
+/// Dependent-first ordering for static linking. GNU ld resolves archives in a
+/// single left-to-right pass, so a library must appear before the ones it
+/// depends on. The list is emitted twice by `link_prebuilt`, which makes any
+/// residual cycle (e.g. ggml <-> ggml-base) resolvable regardless.
+fn prebuilt_link_priority(name: &str) -> u8 {
+    if name.contains("common_wrapper") {
+        0
+    } else if name == "llama-common" {
+        1
+    } else if name.starts_with("llama-common") {
+        2
+    } else if name == "llama" {
+        3
+    } else if name == "ggml-cpu" {
+        5
+    } else if name == "ggml" {
+        6
+    } else if name == "ggml-base" {
+        7
+    } else if name.starts_with("ggml-") {
+        // GPU/accelerator backends: ggml-metal, ggml-cuda, ggml-vulkan, ...
+        4
+    } else {
+        8
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn link_prebuilt(
+    prebuilt_dir: &Path,
+    out_dir: &Path,
+    target_os: &TargetOs,
+    profile: &str,
+    static_crt: bool,
+) {
+    assert!(
+        prebuilt_dir.is_dir(),
+        "ZVEC_LLAMA_PREBUILT_DIR does not exist: {}",
+        prebuilt_dir.display()
+    );
+
+    // 1. Platform-specific bindings generated during the release CI build.
+    let src_bindings = prebuilt_dir.join("bindings.rs");
+    assert!(
+        src_bindings.is_file(),
+        "prebuilt bundle is missing bindings.rs at {}",
+        src_bindings.display()
+    );
+    std::fs::copy(&src_bindings, out_dir.join("bindings.rs"))
+        .expect("failed to copy prebuilt bindings.rs into OUT_DIR");
+
+    // 2. Static archives.
+    let lib_dir = prebuilt_dir.join("lib");
+    assert!(
+        lib_dir.is_dir(),
+        "prebuilt bundle is missing lib/ directory at {}",
+        lib_dir.display()
+    );
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    let mut libs: Vec<String> = std::fs::read_dir(&lib_dir)
+        .expect("failed to read prebuilt lib directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .and_then(|name| prebuilt_archive_lib_name(&name))
+        })
+        .collect();
+    libs.sort_by_key(|name| (prebuilt_link_priority(name), name.clone()));
+    libs.dedup();
+    assert!(
+        !libs.is_empty(),
+        "prebuilt lib directory contains no static archives: {}",
+        lib_dir.display()
+    );
+    // Two passes so GNU ld can satisfy circular references between archives.
+    for _ in 0..2 {
+        for name in &libs {
+            println!("cargo:rustc-link-lib=static={name}");
+        }
+    }
+
+    // 3. CUDA runtime libraries (only when the cuda feature is active).
+    if cfg!(feature = "cuda") {
+        println!("cargo:rerun-if-env-changed=CUDA_PATH");
+        for dir in find_cuda_helper::find_cuda_lib_dirs() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        match target_os {
+            TargetOs::Windows(WindowsVariant::Msvc) => {
+                println!("cargo:rustc-link-lib=cudart");
+                println!("cargo:rustc-link-lib=cublas");
+                println!("cargo:rustc-link-lib=cublasLt");
+                if !cfg!(feature = "cuda-no-vmm") {
+                    println!("cargo:rustc-link-lib=cuda");
+                }
+            }
+            _ => {
+                println!("cargo:rustc-link-lib=static=cudart_static");
+                println!("cargo:rustc-link-lib=static=cublas_static");
+                println!("cargo:rustc-link-lib=static=cublasLt_static");
+                if !cfg!(feature = "cuda-no-vmm") {
+                    println!("cargo:rustc-link-lib=cuda");
+                }
+                println!("cargo:rustc-link-lib=static=culibos");
+            }
+        }
+    }
+
+    // 4. Platform system libraries / frameworks (mirrors the from-source tail).
+    match target_os {
+        TargetOs::Windows(WindowsVariant::Msvc) => {
+            println!("cargo:rustc-link-lib=advapi32");
+            if profile.eq_ignore_ascii_case("debug") {
+                if static_crt {
+                    println!("cargo:rustc-link-lib=libcmtd");
+                } else {
+                    println!("cargo:rustc-link-lib=dylib=msvcrtd");
+                }
+            }
+        }
+        TargetOs::Linux => {
+            if cfg!(feature = "static-stdcxx") {
+                emit_compiler_static_archive_search_path("libstdc++.a");
+                println!("cargo:rustc-link-lib=static=stdc++");
+            } else {
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+            }
+        }
+        TargetOs::Apple(variant) => {
+            println!("cargo:rustc-link-lib=framework=Foundation");
+            if !matches!(variant, AppleVariant::WatchOS) {
+                println!("cargo:rustc-link-lib=framework=Metal");
+                println!("cargo:rustc-link-lib=framework=MetalKit");
+            }
+            println!("cargo:rustc-link-lib=framework=Accelerate");
+            println!("cargo:rustc-link-lib=c++");
+            if matches!(variant, AppleVariant::MacOS) {
+                if let Some(path) = macos_link_search_path() {
+                    println!("cargo:rustc-link-lib=clang_rt.osx");
+                    println!("cargo:rustc-link-search={path}");
+                }
+            }
+        }
+        TargetOs::Android => {
+            if cfg!(feature = "static-stdcxx") {
+                println!("cargo:rustc-link-lib=c++_static");
+                println!("cargo:rustc-link-lib=c++abi");
+            } else if cfg!(feature = "shared-stdcxx") {
+                println!("cargo:rustc-link-lib=c++_shared");
+            }
+        }
+        _ => (),
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -417,6 +604,30 @@ fn main() {
     debug_log!("TARGET_DIR: {}", target_dir.display());
     debug_log!("OUT_DIR: {}", out_dir.display());
     debug_log!("BUILD_SHARED: {}", build_shared_libs);
+
+    // zvec-ai: prebuilt linking path. When the `prebuilt` feature is enabled or
+    // ZVEC_LLAMA_PREBUILT_DIR is provided, link against the prebuilt bundle and
+    // return early, skipping bindgen / cc / CMake. The from-source path below is
+    // unchanged and remains the fallback (and is required to *produce* the
+    // bundle in the release CI).
+    println!("cargo:rerun-if-env-changed=ZVEC_LLAMA_PREBUILT_DIR");
+    let prebuilt_dir_env = env::var("ZVEC_LLAMA_PREBUILT_DIR")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let prebuilt_dir = if cfg!(feature = "prebuilt") {
+        Some(PathBuf::from(
+            prebuilt_dir_env
+                .clone()
+                .expect("feature \"prebuilt\" is enabled but ZVEC_LLAMA_PREBUILT_DIR is not set"),
+        ))
+    } else {
+        prebuilt_dir_env.map(PathBuf::from)
+    };
+    if let Some(prebuilt_dir) = prebuilt_dir {
+        debug_log!("PREBUILT_DIR: {}", prebuilt_dir.display());
+        link_prebuilt(&prebuilt_dir, &out_dir, &target_os, &profile, static_crt);
+        return;
+    }
 
     // Make sure that changes to the llama.cpp project trigger a rebuild.
     let rebuild_on_children_of = [

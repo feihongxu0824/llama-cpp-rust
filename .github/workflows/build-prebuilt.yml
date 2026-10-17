@@ -1,0 +1,198 @@
+name: Build prebuilt llama.cpp bundles
+
+# Produces per-platform prebuilt llama.cpp static-library bundles that
+# downstream consumers (zvec-grep) link against via the `prebuilt` feature of
+# llama-cpp-sys-2, so they never compile llama.cpp from source.
+#
+# Strategy: for each target/variant we run a NORMAL from-source
+# `cargo build -p llama-cpp-sys-2` (which is the authoritative producer of both
+# the platform-specific bindings.rs and the static archives), then harvest the
+# artifacts with scripts/collect_prebuilt.py and publish them to a GitHub
+# Release. This guarantees the shipped bundle is byte-for-byte what the
+# from-source path would have linked.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Which platform stage to build.
+        type: choice
+        options: ["1", "2", "all"]
+        default: "1"
+      version:
+        description: Bundle version label (defaults to the crate version).
+        type: string
+        default: ""
+      publish:
+        description: Publish to a GitHub Release instead of only uploading workflow artifacts.
+        type: boolean
+        default: false
+  push:
+    branches: ["zvec/prebuilt-**"]
+    paths:
+      - "llama-cpp-sys-2/llama.cpp"
+      - "llama-cpp-sys-2/build.rs"
+      - "llama-cpp-sys-2/Cargo.toml"
+      - "llama-cpp-sys-2/wrapper*"
+      - ".github/workflows/build-prebuilt.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prebuilt-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} (${{ matrix.variant }})
+    # Stage gate: push runs default to stage 1; workflow_dispatch honours inputs.stage.
+    if: ${{ (github.event.inputs.stage || '1') == 'all' || (github.event.inputs.stage || '1') == matrix.stage }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Stage 1: CPU, three main platforms ----
+          - stage: "1"
+            target: aarch64-apple-darwin
+            variant: cpu
+            runner: macos-14
+            sys_features: metal
+          - stage: "1"
+            target: x86_64-unknown-linux-gnu
+            variant: cpu
+            runner: ubuntu-24.04
+            sys_features: ""
+          - stage: "1"
+            target: x86_64-pc-windows-msvc
+            variant: cpu
+            runner: windows-2022
+            sys_features: ""
+          # ---- Stage 2: remaining platforms + CUDA ----
+          - stage: "2"
+            target: x86_64-apple-darwin
+            variant: cpu
+            runner: macos-15-intel
+            sys_features: ""
+          - stage: "2"
+            target: aarch64-unknown-linux-gnu
+            variant: cpu
+            runner: ubuntu-24.04-arm
+            sys_features: ""
+          - stage: "2"
+            target: x86_64-unknown-linux-gnu
+            variant: cuda
+            runner: ubuntu-24.04
+            sys_features: cuda
+          - stage: "2"
+            target: x86_64-pc-windows-msvc
+            variant: cuda
+            runner: windows-2022
+            sys_features: cuda
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The vendored llama.cpp submodule is the single source of truth for
+          # both the archives and the bindings; it must be present.
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake ninja-build pkg-config
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install the pinned Rust toolchain and target
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+
+      - name: Resolve versions
+        id: meta
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.version }}"
+          if [[ -z "$version" ]]; then
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' llama-cpp-sys-2/Cargo.toml | head -1)"
+          fi
+          llama_commit="$(git -C llama-cpp-sys-2/llama.cpp rev-parse HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "llama_commit=$llama_commit" >> "$GITHUB_OUTPUT"
+          echo "bundle=llama-prebuilt-${{ matrix.target }}-${{ matrix.variant }}-$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build llama-cpp-sys-2 from source (authoritative artifact producer)
+        shell: bash
+        run: |
+          features="--features ${{ matrix.sys_features }}"
+          if [[ -z "${{ matrix.sys_features }}" ]]; then features=""; fi
+          cargo build --release --target ${{ matrix.target }} -p llama-cpp-sys-2 $features
+
+      - name: Collect the prebuilt bundle
+        shell: bash
+        run: |
+          out_dir="$(ls -d target/${{ matrix.target }}/release/build/llama-cpp-sys-2-*/out | head -1)"
+          echo "OUT_DIR=$out_dir"
+          python3 scripts/collect_prebuilt.py \
+            --out-dir "$out_dir" \
+            --dest "dist/${{ steps.meta.outputs.bundle }}" \
+            --target "${{ matrix.target }}" \
+            --variant "${{ matrix.variant }}" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --llama-cpp-commit "${{ steps.meta.outputs.llama_commit }}" \
+            --profile release
+
+      - name: Package the bundle
+        shell: bash
+        run: |
+          mkdir -p dist/assets
+          tar -czf "dist/assets/${{ steps.meta.outputs.bundle }}.tar.gz" -C dist "${{ steps.meta.outputs.bundle }}"
+          (cd dist/assets && shasum -a 256 "${{ steps.meta.outputs.bundle }}.tar.gz" > "${{ steps.meta.outputs.bundle }}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.bundle }}
+          path: |
+            dist/assets/${{ steps.meta.outputs.bundle }}.tar.gz
+            dist/assets/${{ steps.meta.outputs.bundle }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish prebuilt bundles to a GitHub Release
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: llama-prebuilt-*
+          merge-multiple: true
+          path: assets
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' llama-cpp-sys-2/Cargo.toml | head -1)"
+          tag="prebuilt-$version-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" assets/* \
+            --title "llama.cpp prebuilt bundles $version (build $GITHUB_RUN_NUMBER)" \
+            --notes "Prebuilt llama.cpp static libraries + per-platform bindings.rs for llama-cpp-rs $version. Consume via ZVEC_LLAMA_PREBUILT_DIR + the \`prebuilt\` feature." \
+            || gh release upload "$tag" assets/* --clobber
