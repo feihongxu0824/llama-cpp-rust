@@ -98,10 +98,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # The vendored llama.cpp submodule is the single source of truth for
-          # both the archives and the bindings; it must be present.
-          submodules: recursive
           persist-credentials: false
+
+      # llama.cpp is intentionally NOT a git submodule here. A submodule would
+      # force every downstream `cargo` git-dependency fetch to pull llama.cpp's
+      # full history (~224MB) even though the prebuilt path never reads its
+      # sources. Only this bundle-producing workflow needs the sources, so it
+      # shallow-fetches the exact pinned commit (tree only, no history).
+      - name: Fetch the pinned llama.cpp sources (shallow)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LLAMA_COMMIT=5f55650a78f92aff4d48d671423e888fac0469ff
+          DEST=llama-cpp-sys-2/llama.cpp
+          rm -rf "$DEST"
+          git init -q "$DEST"
+          git -C "$DEST" remote add origin https://github.com/ggml-org/llama.cpp
+          git -C "$DEST" fetch -q --depth 1 origin "$LLAMA_COMMIT"
+          git -C "$DEST" checkout -q FETCH_HEAD
+          echo "llama.cpp @ $(git -C "$DEST" rev-parse HEAD)"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
